@@ -1,6 +1,7 @@
 const assert = require('assert');
 const {Builder, By, promise, until} = require('selenium-webdriver');
-const {Eyes, Target} = require('eyes.selenium');
+const {Eyes, Target} = require('@applitools/eyes-selenium');
+var ConsoleLogHandler = require('@applitools/eyes-selenium').ConsoleLogHandler;
 var ApplitoolsTestResultHandler = require('../applitoolsTestHandler').ApplitoolsTestResultHandler;
 promise.USE_PROMISE_MANAGER = false;
 
@@ -10,7 +11,8 @@ describe('Simple Test', function() {
 
     beforeEach(async function() {
         eyes = new Eyes();
-        eyes.setApiKey("YOUR-API-KEY");
+        eyes.setLogHandler(new ConsoleLogHandler(true));
+        eyes.setApiKey("YOUR_API_KEY");
         driver = await new Builder().forBrowser('chrome').build();
     });
 
@@ -21,7 +23,7 @@ describe('Simple Test', function() {
 
     it('Results Handler test', async function() {
 
-        var applitoolsViewKey = 'YOUR-VIEW-KEY'
+        var applitoolsViewKey = 'YOUR_VIEW_KEY'
         let downloadPath = process.cwd()+'/downloadImages'
         var downloadDir = downloadPath
 
@@ -33,12 +35,10 @@ describe('Simple Test', function() {
 
         let results = await eyes.close(false);
 
-        const handler= new ApplitoolsTestResultHandler(results, applitoolsViewKey);
-        await handler.downloadImages(downloadDir, 'diff'); //valid types = baseline, current, diff
+        const handler = new ApplitoolsTestResultHandler(results, applitoolsViewKey);
+        await handler.downloadImages(downloadDir, 'current'); //valid types = baseline, current, diff
 
         let testStatus = handler.stepStatusArray();
         console.log("My Test Status: " + testStatus);
-
-
     });
 });

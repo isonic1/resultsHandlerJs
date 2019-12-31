@@ -1,5 +1,7 @@
-const fs =require('fs');
+const fs = require('fs');
 const https = require('https');
+const fetch = require('node-fetch');
+const Stream = require('stream').Transform
 
 class ApplitoolsTestResultHandler {
     constructor(testResult, viewKey) {
@@ -22,7 +24,7 @@ class ApplitoolsTestResultHandler {
         return results;
     }
 
-    downloadImages(dir, type) {
+    async downloadImages(dir, type) {
         if (dir == undefined || !fs.existsSync(dir)) {
             console.log(`Directory was undefined or non-existent. Saving images to: ${process.cwd()}`);
             dir = process.cwd();
@@ -30,8 +32,8 @@ class ApplitoolsTestResultHandler {
             console.log(`Saving images to: ${dir}`);
         }
 
-        const imagesDir = this.directoryCreator(dir);
-        const images = this.getImageUrls(type);
+        const imagesDir = await this.directoryCreator(dir);
+        const images = await this.getImageUrls(type);
         for (let i = 0, len = images.length; i < len; i++) {
             const fileName = `${imagesDir}/${images[i][0]}`;
             const downloadUrl = (`${images[i][1]}?apiKey=${this.viewKey}`);
@@ -46,29 +48,29 @@ class ApplitoolsTestResultHandler {
     }
 
     testName() {
-        return this.testValues().name;
+        return this.testValues()._name;
     }
 
     appName() {
-        return this.testValues().appName;
+        return this.testValues()._appName;
     }
 
     viewportSize() {
-        const width = this.testValues().hostDisplaySize.width;
-        const height = this.testValues().hostDisplaySize.height;
+        const width = this.testValues()._hostDisplaySize.width;
+        const height = this.testValues()._hostDisplaySize.height;
         return `${width}x${height}`;
     }
 
     hostingOS() {
-        return this.testValues().hostOS;
+        return this.testValues()._hostOS;
     }
 
     hostingApp() {
-        return this.testValues().hostApp;
+        return this.testValues()._hostApp;
     }
 
     setTestURL() {
-        return this.testValues().appUrls.session;
+        return this.testValues()._appUrls._session;
     }
 
     setServerURL() {
@@ -76,40 +78,40 @@ class ApplitoolsTestResultHandler {
     }
 
     setBatchID() {
-        return this.testValues().batchId;
+        return this.testValues()._batchId;
     }
 
     setSessionID() {
-        return this.testValues().id;
+        return this.testValues()._id;
     }
 
     steps() {
-        return this.testValues().steps;
+        return this.testValues()._steps;
     }
 
     getStepInfo(index) {
-        return this.testValues().stepsInfo[index];
+        return this.testValues()._stepsInfo[index];
     }
 
     isTrue(a, b) {
         return !a.some((e, i) => e != b[i]);
     }
 
-    getStepResults() {
+    async getStepResults() {
         const stepResults = new Array;
         let status = new String;
 
         for (let i = 0; i < this.steps; ++i) {
-            const isDifferent = this.getStepInfo(i).isDifferent;
-            const hasBaselineImage = this.getStepInfo(i).hasBaselineImage;
-            const hasCurrentImage = this.getStepInfo(i).hasCurrentImage;
+            const isDifferent = this.getStepInfo(i)._isDifferent;
+            const hasBaselineImage = this.getStepInfo(i)._hasBaselineImage;
+            const hasCurrentImage = this.getStepInfo(i)._hasCurrentImage;
 
             const bools = [ isDifferent, hasBaselineImage, hasCurrentImage ];
 
             const isNew     = [ false, false, true  ];
             const isMissing = [ false, true,  false ];
             const isPassed  = [ false, true,  true  ];
-            const isFailed  = [ true,  true,  true  ];
+            const isUnresolved  = [ true,  true,  true  ];
 
             if (this.isTrue(isPassed, bools)) {
                 status = "PASS"
@@ -123,22 +125,85 @@ class ApplitoolsTestResultHandler {
                 status = "NEW"
             }
 
-            if (this.isTrue(isFailed, bools)) {
-                status = "FAIL"
+            if (this.isTrue(isUnresolved, bools)) {
+                status = "UNRESOLVED"
             }
 
+            const obj = await this.getSessionDetailsJson()
             const stepInfo = {
                 step: i + 1,
                 status,
-                name: this.getStepInfo(i).name,
-                baselineImage: this.getStepInfo(i).apiUrls.baselineImage,
-                currentImage: this.getStepInfo(i).apiUrls.currentImage,
-                diffImage: this.getStepInfo(i).apiUrls.diffImage
+                name: this.getStepInfo(i)._name,
+                baselineImageURL: this.getImageUrlByStatus(obj,'baseline'),
+                currentImageURL: this.getImageUrlByStatus(obj, 'current'),
+                diffImageURL: this.getDiffUrl(status, i + 1)
             };
             stepResults.push(stepInfo);
         }
         return stepResults;
     }
+
+
+    async getSessionDetailsJson(){
+        const URL = `${this.serverURL}/api/sessions/batches/${this.batchId}/${this.sessionId}/?ApiKey=${this.viewKey}`;
+        return await fetch(URL)
+            .then(res => res.json())
+    }
+
+    getSpecificImageUrl(imageId) {
+        return `${this.serverURL}/api/images/${imageId}?apiKey=${this.viewKey}`;
+    }
+
+    getSpecificDiffImageUrl(step) {
+       return`${this.serverURL}/api/sessions/batches/${this.batchId}/${this.sessionId}/steps/${step}/diff?ApiKey=${this.viewKey}`;
+    }
+
+    getImageUrlByStatus(obj, type, step){
+        let UIDS = new Array;;
+        if (type == "baseline") {
+            UIDS = this.getImageUIDs(obj["expectedAppOutput"]);
+        } else if (type == "current") {
+            UIDS = this.getImageUIDs(obj["actualAppOutput"]);
+        }
+        let URL;
+        for (let i = 0; i < UIDS.length; i++) {
+            if (UIDS[i] == null) {
+                URL = null;
+                console.log("Bad image URL received")
+            } else {
+                URL = this.getSpecificImageUrl(UIDS[i])
+            }
+        }
+        return URL
+    }
+
+    getImageUIDs(metadata){
+        let retUIDs = new Array;
+        for (let i = 0; i < metadata.length; i++) {
+            if (metadata[i] == null) {
+                retUIDs.push(null);
+                console.log("Broken Json received from the server..")
+            } else {
+                var entry = metadata[i];
+                var image = entry["image"];
+                retUIDs.push(image["id"]);
+            }
+        }
+        return retUIDs;
+    }
+
+    getDiffUrl(status, step) {
+        let diffUrl;
+        if (status == 'UNRESOLVED' || status == 'NEW'){
+            diffUrl = this.getSpecificDiffImageUrl(step)
+        }
+        else {
+            diffUrl = null
+            console.log("No unresolved or new tests found..")
+        }
+        return diffUrl
+    }
+
 
     directoryCreator(path) {
         const dirStructure = [this.testName,this.appName,this.viewportSize,
@@ -165,13 +230,14 @@ class ApplitoolsTestResultHandler {
         }
     }
 
-    getImageUrls(type) {
-        const images = this.getStepResults().map(obj => {
+    async getImageUrls(type) {
+        const images = await this.getStepResults();
+        images.map(obj => {
             const fileName = `${obj.step}-${obj.name}-${type}.png`;
             const imagesArray = {
-                baseline: [fileName, obj.baselineImage],
-                current: [fileName, obj.currentImage],
-                diff: [fileName, obj.diffImage]
+                baseline: [fileName, obj.baselineImageURL],
+                current: [fileName, obj.currentImageURL],
+                diff: [fileName, obj.diffImageURL]
             };
             return imagesArray
         });
@@ -190,11 +256,18 @@ class ApplitoolsTestResultHandler {
         return imageUrls;
     }
 
-    downloadImage(fileName, url) {
-        const file = fs.createWriteStream(fileName);
-        const request = https.get(url, response => {
-            response.pipe(file);
-        });
+    async downloadImage(fileName, url) {
+        const res = await fetch(url);
+        await new Promise((resolve, reject) => {
+            const fileStream = fs.createWriteStream(fileName);
+            res.body.pipe(fileStream);
+            res.body.on("error", (err) => {
+                reject(err);
+            });
+            fileStream.on("finish", function() {
+                resolve();
+            });
+        });        
     }
 }
 
