@@ -1,11 +1,47 @@
 const {promisify} = require('util')
 const fs = require('fs');
-const https = require('https');
 const fetch = require('node-fetch');
-const Stream = require('stream').Transform
+const axios = require('axios')
+const tunnel = require('tunnel')
+const dateFormat = require('dateformat')
+
+const RETRY_REQUEST_INTERVAL = 500 // ms
+const LONG_REQUEST_DELAY_MS = 2000 // ms
+const MAX_LONG_REQUEST_DELAY_MS = 10000 // ms
+const DEFAULT_TIMEOUT_MS = 300000 // ms (5 min)
+const REDUCED_TIMEOUT_MS = 15000 // ms (15 sec)
+const LONG_REQUEST_DELAY_MULTIPLICATIVE_INCREASE_FACTOR = 1.5
+const DATE_FORMAT_RFC1123 = "ddd, dd mmm yyyy HH:MM:ss 'GMT'"
+let counter = 0
+
+
+const HTTP_STATUS_CODES = {
+    CREATED: 201,
+    ACCEPTED: 202,
+    OK: 200,
+    GONE: 410,
+    NOT_FOUND: 404,
+    INTERNAL_SERVER_ERROR: 500,
+    BAD_GATEWAY: 502,
+    GATEWAY_TIMEOUT: 504,
+  }
+
+  const HTTP_FAILED_CODES = [
+    HTTP_STATUS_CODES.NOT_FOUND,
+    HTTP_STATUS_CODES.INTERNAL_SERVER_ERROR,
+    HTTP_STATUS_CODES.BAD_GATEWAY,
+    HTTP_STATUS_CODES.GATEWAY_TIMEOUT,
+  ]
+
+  const REQUEST_FAILED_CODES = ['ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN']
+
+  const DEFAULT_HEADERS = {
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+  }
 
 class ApplitoolsTestResultHandler {
-    constructor(testResult, viewKey) {
+    constructor(testResult, viewKey, proxyServerUrl, proxyServerPort, proxyServerUsername, proxyServerPassword, isHttpOnly) {
         this.testResult = testResult;
         this.viewKey = viewKey;
         this.testName = this.testName();
@@ -18,6 +54,16 @@ class ApplitoolsTestResultHandler {
         this.batchId = this.setBatchID();
         this.sessionId = this.setSessionID();
         this.steps = this.steps();
+        if (proxyServerUrl != null && proxyServerPort != null){
+            this.proxy = this.setProxy(proxyServerUrl, proxyServerPort, proxyServerUsername, proxyServerPassword, isHttpOnly);
+        }
+        this.httpOptions = {
+            proxy: undefined,
+            headers: DEFAULT_HEADERS,
+            timeout: DEFAULT_TIMEOUT_MS,
+            responseType: 'json',
+            params: {},
+          }
     }
 
     async stepStatusArray() {
@@ -44,6 +90,7 @@ class ApplitoolsTestResultHandler {
     }
 
     ///Private Methods
+
     testValues() {
         //return this.testResult.value_;
         return this.testResult;
@@ -85,6 +132,28 @@ class ApplitoolsTestResultHandler {
 
     setSessionID() {
         return this.testValues()._id;
+    }
+
+    setProxy(uri, proxyServerPort, proxyUsername, proxyPassword, isHttpOnly = false){
+        const proxy = {}
+        let url = new URL(uri.includes('://') ? uri : `http://${uri}:${proxyServerPort}`)
+        proxy.protocol = url.protocol
+        proxy.host = url.hostname
+        proxy.port = url.port
+        proxy.isHttpOnly = !!isHttpOnly
+        if (!username && url.username) {
+            proxy.auth = {
+              username: url.username,
+              password: url.password,
+            }
+          } else if (username) {
+            proxy.auth = {
+              username: proxyUsername,
+              password: proxyPassword,
+            }
+          }
+
+        return proxy
     }
 
     steps() {
@@ -153,11 +222,11 @@ class ApplitoolsTestResultHandler {
     }
 
     getSpecificImageUrl(imageId) {
-        return `${this.serverURL}/api/images/${imageId}?apiKey=${this.viewKey}`;
+        return `${this.serverURL}/api/images/${imageId}`;
     }
 
     getSpecificDiffImageUrl(step) {
-       return`${this.serverURL}/api/sessions/batches/${this.batchId}/${this.sessionId}/steps/${step}/diff?ApiKey=${this.viewKey}`;
+       return`${this.serverURL}/api/sessions/batches/${this.batchId}/${this.sessionId}/steps/${step}/diff`;
     }
 
     getImageUrlByStatus(obj, type){
@@ -171,7 +240,6 @@ class ApplitoolsTestResultHandler {
         for (let i = 0; i < UIDS.length; i++) {
             if (UIDS[i] == null) {
                 URL = null;
-                // console.log("Bad image URL received")
             } else {
                 URL = this.getSpecificImageUrl(UIDS[i])
             }
@@ -253,19 +321,170 @@ class ApplitoolsTestResultHandler {
 
         if (imageUrls.length == 0) {
             console.log(`No ${type} images were found. Exiting...`)
-            process.exit(-1); //Maybe return on this instead. Could exit out of script premature.
+            process.exit(-1); 
         }
         return imageUrls;
     }
 
     async downloadImage(fileName, url) {
-        const res = await fetch(url);
-        if (!res.ok) {
-            throw new Error(`could not download ${url}: ${res.status}`)
+        let res;
+        try{
+             res = await this.sendLongRequest({url});
         }
-        const image = await res.buffer()
+        catch (e){
+            throw new Error(`could not download ${url}: ${e}`)
+        }
+        const image = await Buffer.from(res.data, 'binary')
         await promisify(fs.writeFile)(fileName, image)
     }
+
+    async sendLongRequest({url}) {
+        const options = this.createHttpOptions({
+            method: 'GET',
+            url,
+          })
+        const response = await this.sendRequest(options)
+        return this.longRequestCheckStatus(response)
+      }
+
+    async sendRequest(options, retry = 1, delayBeforeRetry = false) {
+        counter += 1
+        const requestId = `${counter}--${this.guid()}`
+        options.headers['x-applitools-eyes-client-request-id'] = requestId
+        try {
+          const response = await axios(options)
+    
+          console.log(
+            `[${requestId}] - result ${response.statusText}, status code ${response.status}, url ${options.url}`,
+          )
+          return response
+        } catch (err) {
+          const reasonMsg = `${err.message}${err.response ? `(${err.response.statusText})` : ''}`
+      
+          console.log(
+            `ServerConnector[${requestId}] - ${
+              options.method
+            } request failed. reason=${reasonMsg} | url=${options.url} ${
+              err.response ? `| status=${err.response.status} ` : ''
+            }| params=${JSON.stringify(options.params).slice(0, 100)}`,
+          )
+      
+          if (err.response && err.response.data) {
+            console.log(`ServerConnector - failure body:\n${err.response.data}`)
+          }
+      
+          if (
+            retry > 0 &&
+            ((err.response && HTTP_FAILED_CODES.includes(err.response.status)) ||
+              REQUEST_FAILED_CODES.includes(err.code))
+          ) {
+            console.log(`ServerConnector retrying request with delay ${delayBeforeRetry}...`)
+      
+            if (delayBeforeRetry) {
+                await new Promise(r => setTimeout(r, RETRY_REQUEST_INTERVAL))
+              return this.sendRequest(options, retry - 1, delayBeforeRetry)
+            }
+      
+            return this.sendRequest(options, retry - 1, delayBeforeRetry)
+          }
+      
+          throw new Error(reasonMsg)
+        }
+    }
+
+    async longRequestCheckStatus(response) {
+        switch (response.status) {
+          case HTTP_STATUS_CODES.OK: {
+            return response
+          }
+          case HTTP_STATUS_CODES.ACCEPTED: {
+            const options = this.createHttpOptions({
+              method: 'GET',
+              url: response.headers.location,
+            })
+            const requestResponse = await this.longRequestLoop(options, LONG_REQUEST_DELAY_MS)
+            return this.longRequestCheckStatus(requestResponse)
+          }
+          case HTTP_STATUS_CODES.CREATED: {
+            const options = this.createHttpOptions({
+              method: 'DELETE',
+              url: response.headers.location,
+            })
+            return this.sendRequest(options)
+          }
+          case HTTP_STATUS_CODES.GONE: {
+            throw new Error('The server task has gone.')
+          }
+          default: {
+            throw new Error(`Unknown error during long request: ${JSON.stringify(response)}`)
+          }
+        }
+      }
+
+      async longRequestLoop(options, delay) {
+        delay = Math.min(
+          MAX_LONG_REQUEST_DELAY_MS,
+          Math.floor(delay * LONG_REQUEST_DELAY_MULTIPLICATIVE_INCREASE_FACTOR),
+        )
+        console.log(`Still running... Retrying in ${delay} ms`)
+      
+        await new Promise(r => setTimeout(r, delay))
+        const response = await this.sendRequest(options)
+        if (response.status !== HTTP_STATUS_CODES.OK) {
+          return response
+        }
+        return longRequestLoop(options, delay)
+      }
+
+      createHttpOptions(requestOptions) {
+        let options = requestOptions
+        options.responseType = 'arraybuffer'
+        options.headers = {}
+        options.headers['Eyes-Expect'] = '202+location' 
+        options.headers['Eyes-Date'] = dateFormat(new Date(), DATE_FORMAT_RFC1123, true) 
+       
+        options.params = {}
+        options.params.apiKey = this.viewKey
+        if (this.proxy != null) {
+          this.setProxyOptions({options})
+        }
+        options.maxContentLength = 20 * 1024 * 1024
+        return options
+      }
+
+      setProxyOptions(options){
+        if (!proxy.getIsHttpOnly()) {
+            options.proxy = this.proxy
+            console.log('using proxy', options.proxy.host, options.proxy.port)
+            return
+          }
+          const proxyObject = this.proxy
+          const proxyAuth =
+            proxyObject.auth && proxyObject.auth.username
+              ? `${proxyObject.auth.username}:${proxyObject.auth.password}`
+              : undefined
+          const agent = tunnel.httpsOverHttp({
+            proxy: {
+              host: proxyObject.host,
+              port: proxyObject.port || 8080,
+              proxyAuth,
+            },
+          })
+          options.httpsAgent = agent
+          options.proxy = false // don't use the proxy, we use tunnel.
+      }
+
+      guid() {
+        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+          // noinspection MagicNumberJS, NonShortCircuitBooleanExpressionJS
+          const r = (Math.random() * 16) | 0 // eslint-disable-line no-bitwise
+          // noinspection MagicNumberJS, NonShortCircuitBooleanExpressionJS
+          const v = c === 'x' ? r : (r & 0x3) | 0x8 // eslint-disable-line no-bitwise
+          return v.toString(16)
+        })
+    }
+
+    
 }
 
 exports.ApplitoolsTestResultHandler = ApplitoolsTestResultHandler;

@@ -13,7 +13,7 @@ describe('Simple Test', function() {
     beforeEach(async function() {
         eyes = new Eyes();
         eyes.setLogHandler(new ConsoleLogHandler(true));
-        eyes.setApiKey("APPLITOOLS_API_KEY");
+        eyes.setApiKey("APPLITOOLS_VIEW_KEY");
         driver = await new Builder().forBrowser('chrome').build();
     });
 
@@ -32,11 +32,13 @@ describe('Simple Test', function() {
         await driver.get("http://the-internet.herokuapp.com/dynamic_content");
 
         await eyes.checkWindow("landingPage");
-        await eyes.checkWindow("second check")
+        // await eyes.checkWindow("second check")
 
         let results = await eyes.close(false);
 
         const handler = new ApplitoolsTestResultHandler(results, applitoolsViewKey);
+        // const handler = new ApplitoolsTestResultHandler(results, applitoolsViewKey, "ProxyServerlURL", "ProxyPort");
+        // const handler = new ApplitoolsTestResultHandler(results, applitoolsViewKey, "ProxyServerlURL", "ProxyPort", "ProxyServerUsername", "ProxyServerPassword");
         await handler.downloadImages(downloadDir, 'diff'); //valid types = baseline, current, diff
 
         let testStatus = await handler.stepStatusArray();
