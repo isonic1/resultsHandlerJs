@@ -1,3 +1,4 @@
+const {promisify} = require('util')
 const fs = require('fs');
 const https = require('https');
 const fetch = require('node-fetch');
@@ -19,8 +20,8 @@ class ApplitoolsTestResultHandler {
         this.steps = this.steps();
     }
 
-    stepStatusArray() {
-        const results = this.getStepResults().map(obj => obj.status);
+    async stepStatusArray() {
+        const results = (await this.getStepResults()).map(obj => obj.status);
         return results;
     }
 
@@ -36,8 +37,9 @@ class ApplitoolsTestResultHandler {
         const images = await this.getImageUrls(type);
         for (let i = 0, len = images.length; i < len; i++) {
             const fileName = `${imagesDir}/${images[i][0]}`;
-            const downloadUrl = (`${images[i][1]}?apiKey=${this.viewKey}`);
-            this.downloadImage(fileName, downloadUrl);
+            const downloadUrl = images[i][1];
+            await this.downloadImage(fileName, downloadUrl);
+            console.log(`Image has been saved to: ${fileName}`)
         }
     }
 
@@ -56,8 +58,8 @@ class ApplitoolsTestResultHandler {
     }
 
     viewportSize() {
-        const width = this.testValues()._hostDisplaySize.width;
-        const height = this.testValues()._hostDisplaySize.height;
+        const width = this.testValues()._hostDisplaySize._width;
+        const height = this.testValues()._hostDisplaySize._height;
         return `${width}x${height}`;
     }
 
@@ -158,7 +160,7 @@ class ApplitoolsTestResultHandler {
        return`${this.serverURL}/api/sessions/batches/${this.batchId}/${this.sessionId}/steps/${step}/diff?ApiKey=${this.viewKey}`;
     }
 
-    getImageUrlByStatus(obj, type, step){
+    getImageUrlByStatus(obj, type){
         let UIDS = new Array;;
         if (type == "baseline") {
             UIDS = this.getImageUIDs(obj["expectedAppOutput"]);
@@ -169,7 +171,7 @@ class ApplitoolsTestResultHandler {
         for (let i = 0; i < UIDS.length; i++) {
             if (UIDS[i] == null) {
                 URL = null;
-                console.log("Bad image URL received")
+                // console.log("Bad image URL received")
             } else {
                 URL = this.getSpecificImageUrl(UIDS[i])
             }
@@ -182,7 +184,7 @@ class ApplitoolsTestResultHandler {
         for (let i = 0; i < metadata.length; i++) {
             if (metadata[i] == null) {
                 retUIDs.push(null);
-                console.log("Broken Json received from the server..")
+                // console.log("Broken Json received from the server..")
             } else {
                 var entry = metadata[i];
                 var image = entry["image"];
@@ -205,19 +207,19 @@ class ApplitoolsTestResultHandler {
     }
 
 
-    directoryCreator(path) {
+    async directoryCreator(path) {
         const dirStructure = [this.testName,this.appName,this.viewportSize,
             this.hostOS,this.hostApp,this.batchId,this.sessionId];
 
-        const currentDir = process.cwd();
-        process.chdir(path);
-        dirStructure.forEach(dir => {
+        const currentDir = await process.cwd();
+        await process.chdir(path);
+        await dirStructure.forEach(dir => {
             if (!fs.existsSync(dir)){
                 fs.mkdirSync(dir);
             }
             process.chdir(dir);
         });
-        process.chdir(currentDir);
+        await process.chdir(currentDir);
         return (`${path}/${dirStructure.toString().replace(/,/g, '/')}`);
     }
 
@@ -231,8 +233,8 @@ class ApplitoolsTestResultHandler {
     }
 
     async getImageUrls(type) {
-        const images = await this.getStepResults();
-        images.map(obj => {
+        let images = await this.getStepResults();
+        images = await images.map(obj => {
             const fileName = `${obj.step}-${obj.name}-${type}.png`;
             const imagesArray = {
                 baseline: [fileName, obj.baselineImageURL],
@@ -243,7 +245,7 @@ class ApplitoolsTestResultHandler {
         });
 
         this.validateType(type);
-        const imageUrls = images.map(obj => {
+        const imageUrls = await images.map(obj => {
             if (obj[type][1] != undefined) {
                 return obj[type]
             }
@@ -258,16 +260,11 @@ class ApplitoolsTestResultHandler {
 
     async downloadImage(fileName, url) {
         const res = await fetch(url);
-        await new Promise((resolve, reject) => {
-            const fileStream = fs.createWriteStream(fileName);
-            res.body.pipe(fileStream);
-            res.body.on("error", (err) => {
-                reject(err);
-            });
-            fileStream.on("finish", function() {
-                resolve();
-            });
-        });        
+        if (!res.ok) {
+            throw new Error(`could not download ${url}: ${res.status}`)
+        }
+        const image = await res.buffer()
+        await promisify(fs.writeFile)(fileName, image)
     }
 }
 
